@@ -1,0 +1,299 @@
+#!/bin/sh
+# Managed by Maze Linux (maze-snapshots).
+#
+# maze-enable-rollback — make `snapper rollback` actually take effect.
+#
+# THE PROBLEM
+#
+# Maze seals the kernel command line inside a signed UKI. That is the whole
+# point of the UKI: nobody can edit `apparmor=1` out of it, or add
+# `init=/bin/sh`, without breaking the signature. But it also means the line
+#
+#     rootflags=subvol=/@
+#
+# is baked into every boot. `snapper rollback` works by changing the btrfs
+# DEFAULT SUBVOLUME — and a boot that hardcodes `subvol=/@` never looks at the
+# default. So rollback appears to succeed, and then the machine boots the exact
+# same root it was already booting. Snapshots end up being good for restoring
+# individual files and nothing else.
+#
+# THE FIX
+#
+# Drop `rootflags=subvol=` from the cmdline and set the btrfs default subvolume
+# to what the system boots today. btrfs then mounts the default, `snapper
+# rollback` changes the default, and rollback works — with the cmdline still
+# sealed and signed, because nothing per-snapshot ever has to go into it.
+#
+# WHY THIS IS A SEPARATE, DELIBERATE STEP
+#
+# Getting it wrong means the machine does not boot: with no `subvol=` and a
+# default pointing at the filesystem root (subvolid 5), btrfs mounts a tree that
+# has no /usr and the initramfs finds no init. So every step here is verified
+# before the next one runs, and any failure restores the previous cmdline and
+# rebuilds from it. The one thing this cannot do is boot the machine for you —
+# reboot once, deliberately, when you have a live USB within reach.
+#
+# Usage:
+#   maze-enable-rollback           check what would change, change nothing
+#   maze-enable-rollback --apply   do it
+#   maze-enable-rollback --undo    put `rootflags=subvol=` back
+set -u
+
+CMDLINE=/etc/kernel/cmdline
+FSTAB=/etc/fstab
+BACKUP=/var/lib/maze/cmdline.pre-rollback
+FSTAB_BACKUP=/var/lib/maze/fstab.pre-rollback
+
+APPLY=0
+UNDO=0
+for a in "$@"; do
+    case "$a" in
+        --apply) APPLY=1 ;;
+        --undo)  UNDO=1 ;;
+        -h|--help) sed -n '4,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "maze-enable-rollback: unknown option '$a'" >&2; exit 2 ;;
+    esac
+done
+
+die()  { echo "maze-enable-rollback: $1" >&2; exit 1; }
+note() { echo "  $1"; }
+
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+
+command -v btrfs >/dev/null 2>&1 || die "btrfs-progs is not installed"
+
+# --- what does this machine look like? --------------------------------------
+
+fstype="$(findmnt -no FSTYPE / 2>/dev/null)"
+[ "$fstype" = "btrfs" ] || die "/ is $fstype, not btrfs — rollback booting does not apply"
+
+# The subvolume the running system was mounted from. This is the value the
+# default has to be set to: whatever is booting right now is by definition a
+# root that boots.
+cur_id="$(findmnt -no OPTIONS / | tr ',' '\n' | sed -n 's/^subvolid=//p')"
+cur_path="$(findmnt -no OPTIONS / | tr ',' '\n' | sed -n 's/^subvol=//p')"
+[ -n "$cur_id" ] || die "could not read the current subvolid of /"
+
+def_id="$(btrfs subvolume get-default / 2>/dev/null | awk '{print $2}')"
+has_flag=0
+grep -q 'rootflags=[^ ]*subvol=' "$CMDLINE" 2>/dev/null && has_flag=1
+
+echo "maze-enable-rollback"
+echo
+note "root subvolume:      $cur_path (id $cur_id)"
+note "btrfs default:       ${def_id:-unknown}"
+fstab_line="$(awk '$1 !~ /^#/ && $2=="/" {print NR; exit}' "$FSTAB" 2>/dev/null)"
+fstab_pins=0
+if [ -n "$fstab_line" ] && sed -n "${fstab_line}p" "$FSTAB" | grep -q 'subvol='; then
+    fstab_pins=1
+fi
+
+note "cmdline pins subvol: $([ "$has_flag" = 1 ] && echo yes || echo no)"
+note "fstab pins subvol:   $([ "$fstab_pins" = 1 ] && echo "yes (line $fstab_line)" || echo no)"
+echo
+
+# Prove, without rebooting, that mounting this filesystem with NO subvol option
+# lands on a real root. That is exactly what the initramfs will do after the
+# pin is removed, so this turns "it should boot" into "it does resolve to a root
+# that has /usr and an init". Mounted read-only, at a temp path, then undone.
+default_mounts_a_root() {
+    _dev="$(findmnt -no SOURCE / | sed 's/\[.*\]//')"
+    [ -n "$_dev" ] || return 1
+    _mp="$(mktemp -d 2>/dev/null)" || return 1
+    if ! mount -o ro "$_dev" "$_mp" 2>/dev/null; then
+        rmdir "$_mp" 2>/dev/null
+        return 1
+    fi
+    _rc=1
+    if [ -d "$_mp/usr/lib" ] && [ -d "$_mp/etc" ] && [ -x "$_mp/usr/bin/sh" ]; then
+        _rc=0
+    fi
+    umount "$_mp" 2>/dev/null
+    rmdir "$_mp" 2>/dev/null
+    return "$_rc"
+}
+
+# --- rebuild helper ---------------------------------------------------------
+
+rebuild_and_check() {
+    note "rebuilding the UKI for every installed kernel…"
+    _rc=0
+    for _d in /usr/lib/modules/*/; do
+        [ -f "${_d}vmlinuz" ] || continue
+        _k="${_d%/}"; _k="${_k##*/}"
+        kernel-install add "$_k" "${_d}vmlinuz" >/dev/null 2>&1 \
+            || { echo "  WARNING: kernel-install add failed for $_k" >&2; _rc=1; }
+    done
+    maze-sb-sign --force-bootloader >/dev/null 2>&1 \
+        || { echo "  WARNING: signing reported problems" >&2; _rc=1; }
+    note "verifying the boot chain…"
+    if maze-boot-check --quiet --no-flag; then
+        note "boot chain is sound"
+    else
+        echo "  WARNING: maze-boot-check is not happy — run 'sudo maze-boot-check'" >&2
+        _rc=1
+    fi
+    return "$_rc"
+}
+
+# --- undo -------------------------------------------------------------------
+
+if [ "$UNDO" = 1 ]; then
+    [ -r "$BACKUP" ] || die "no backup at $BACKUP — nothing to undo"
+    cp -f "$BACKUP" "$CMDLINE" || die "could not restore $CMDLINE"
+    note "restored $CMDLINE from $BACKUP"
+    if [ -r "$FSTAB_BACKUP" ]; then
+        cp -f "$FSTAB_BACKUP" "$FSTAB" && note "restored $FSTAB from $FSTAB_BACKUP"
+    fi
+    rebuild_and_check
+    exit $?
+fi
+
+# --- already done? ----------------------------------------------------------
+
+if [ "$has_flag" = 0 ] && [ "$fstab_pins" = 0 ]; then
+    if [ "$def_id" = "$cur_id" ]; then
+        note "Already set up: no subvol pin, and the default is the booting root."
+        note "'snapper rollback <n>' followed by a reboot will work."
+        exit 0
+    fi
+    die "cmdline has no subvol pin but the btrfs default (id ${def_id:-?}) is NOT the
+       booting root (id $cur_id). Booting would mount the wrong tree. Fix with:
+         btrfs subvolume set-default $cur_id /"
+fi
+
+# --- dry run ----------------------------------------------------------------
+
+if [ "$APPLY" = 0 ]; then
+    echo "Would do:"
+    note "1. btrfs subvolume set-default $cur_id /      (default -> the root that boots now)"
+    note "2. remove 'rootflags=subvol=$cur_path' from $CMDLINE"
+    [ "$fstab_pins" = 1 ] && \
+        note "2b. remove 'subvol=' from the / line of $FSTAB (line $fstab_line)"
+    note "3. rebuild + re-sign the UKI for every installed kernel"
+    note "4. verify a subvol-less mount really lands on a root (before touching the cmdline)"
+    note "5. verify with maze-boot-check"
+    echo
+    note "Backup of the current cmdline goes to $BACKUP"
+    note "Re-run with --apply to do it. Undo any time with --undo."
+    echo
+    note "After applying, REBOOT ONCE deliberately to confirm before relying on it."
+    exit 0
+fi
+
+# --- apply ------------------------------------------------------------------
+
+note "setting the btrfs default subvolume to $cur_id ($cur_path)"
+btrfs subvolume set-default "$cur_id" / || die "set-default failed"
+
+# Verify before touching the cmdline. If the default did not take, the pin is
+# the only thing keeping this machine bootable and it must stay.
+new_def="$(btrfs subvolume get-default / 2>/dev/null | awk '{print $2}')"
+if [ "$new_def" != "$cur_id" ]; then
+    die "default subvolume is $new_def, expected $cur_id — refusing to remove the
+       cmdline pin, because without it this machine would not boot"
+fi
+note "verified: btrfs default is now $new_def"
+
+# The decisive pre-flight check: does a subvol-less mount actually find a root?
+note "checking that a subvol-less mount resolves to a real root…"
+if default_mounts_a_root; then
+    note "verified: the default subvolume has /usr, /etc and an init"
+else
+    btrfs subvolume set-default "$def_id" / 2>/dev/null || true
+    die "a subvol-less mount does NOT land on a usable root. The default was put
+       back to $def_id and NOTHING was changed. Removing the cmdline pin would
+       have left this machine unbootable."
+fi
+
+mkdir -p "$(dirname "$BACKUP")" 2>/dev/null || true
+cp -f "$CMDLINE" "$BACKUP" || die "could not back up $CMDLINE"
+note "backed up cmdline to $BACKUP"
+
+# Remove only the subvol= part of rootflags. Other rootflags (compress, ssd…)
+# are deliberately preserved: they are not what pins the subvolume.
+tmp="$CMDLINE.maze-new"
+# Parse rootflags properly instead of deleting the whole parameter. The naive
+# `s/rootflags=subvol=[^ ]*//` had two failures: with
+# `rootflags=subvol=/@,compress=zstd:1` it silently threw compress away, and
+# with `rootflags=compress=zstd:1,subvol=/@` it matched nothing at all. Split on
+# commas, drop only the subvol/subvolid component, keep everything else.
+awk '{
+    out = ""
+    for (i = 1; i <= NF; i++) {
+        t = $i
+        if (t ~ /^rootflags=/) {
+            n = split(substr(t, 11), parts, ",")
+            keep = ""
+            for (j = 1; j <= n; j++)
+                if (parts[j] !~ /^subvol(id)?=/)
+                    keep = (keep == "" ? parts[j] : keep "," parts[j])
+            if (keep == "") continue          # rootflags held nothing else
+            t = "rootflags=" keep
+        }
+        out = (out == "" ? t : out " " t)
+    }
+    print out
+}' "$CMDLINE" > "$tmp" || die "could not rewrite the cmdline"
+
+if grep -q 'subvol=' "$tmp"; then
+    rm -f "$tmp"
+    die "a subvol= reference survived the rewrite — aborting, cmdline untouched"
+fi
+if ! grep -q 'root=' "$tmp"; then
+    rm -f "$tmp"
+    die "the rewritten cmdline has no root= — aborting, cmdline untouched"
+fi
+
+mv -f "$tmp" "$CMDLINE"
+note "new cmdline: $(cat "$CMDLINE")"
+
+# fstab pins the subvolume a SECOND time, and missing it makes the whole change
+# pointless: the initramfs would mount the rolled-back snapshot, then systemd's
+# fstab-generator would remount / back onto the pinned subvolume and the
+# rollback would silently undo itself at boot.
+#
+# Only the / line is touched. /home, /var/cache, /var/log and /swap keep their
+# subvol= — those are separate subvolumes that do not move with a rollback.
+if [ "$fstab_pins" = 1 ]; then
+    cp -f "$FSTAB" "$FSTAB_BACKUP" || die "could not back up $FSTAB"
+    note "backed up fstab to $FSTAB_BACKUP"
+    ftmp="$FSTAB.maze-new"
+    awk -v ln="$fstab_line" '
+        NR == ln {
+            n = gsub(/subvol=[^,[:space:]]*,/, "")
+            if (n == 0) gsub(/,subvol=[^,[:space:]]*/, "")
+            if (n == 0) gsub(/subvol=[^,[:space:]]*/, "defaults")
+        }
+        { print }
+    ' "$FSTAB" > "$ftmp" || die "could not rewrite $FSTAB"
+
+    if sed -n "${fstab_line}p" "$ftmp" | grep -q 'subvol='; then
+        rm -f "$ftmp"; cp -f "$BACKUP" "$CMDLINE"
+        die "subvol= survived the fstab rewrite — reverted, nothing changed"
+    fi
+    if [ "$(awk -v ln="$fstab_line" 'NR==ln{print $2}' "$ftmp")" != "/" ]; then
+        rm -f "$ftmp"; cp -f "$BACKUP" "$CMDLINE"
+        die "the rewritten fstab line is no longer the / entry — reverted"
+    fi
+    mv -f "$ftmp" "$FSTAB"
+    note "new fstab / line: $(sed -n "${fstab_line}p" "$FSTAB")"
+fi
+echo
+
+if rebuild_and_check; then
+    echo
+    note "Done. 'snapper rollback <n>' now changes what boots."
+    note "Reboot once, deliberately, to confirm before relying on it."
+    note "If it does not come up: boot a live USB, chroot in, run"
+    note "  maze-enable-rollback --undo"
+    exit 0
+fi
+
+echo
+echo "maze-enable-rollback: the rebuild or the boot-chain check reported problems." >&2
+echo "maze-enable-rollback: restoring the previous cmdline and rebuilding from it." >&2
+cp -f "$BACKUP" "$CMDLINE"
+[ -r "$FSTAB_BACKUP" ] && cp -f "$FSTAB_BACKUP" "$FSTAB"
+rebuild_and_check
+die "reverted — this machine still boots the way it did before"

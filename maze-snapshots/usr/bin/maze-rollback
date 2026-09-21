@@ -1,0 +1,242 @@
+#!/bin/sh
+# Managed by Maze Linux (maze-snapshots).
+#
+# maze-rollback — go back to an earlier snapshot, and boot it.
+#
+# WHY THIS EXISTS RATHER THAN JUST `snapper rollback`
+#
+# `snapper rollback` was written for a layout where the root filesystem is
+# itself a snapshot. Maze boots a plain @ subvolume, so snapper cannot work out
+# which mode ("ambit") to operate in and stops with:
+#
+#     Cannot detect ambit since default subvolume is unknown.
+#
+# It exits 1 and changes nothing. A user who misses that line reboots expecting
+# an older system and gets the same one back, with no indication anything went
+# wrong — which is the worst way for a recovery tool to fail. Passing
+# `--ambit classic` is all it takes, and this wrapper always passes it.
+#
+# It also refuses the two rollbacks that succeed and then disappoint:
+#
+#   * A snapshot older than `maze-enable-rollback` still carries an /etc/fstab
+#     that pins subvol=/@. Boot it and systemd mounts you straight back onto @,
+#     so the rollback silently undoes itself.
+#   * A snapshot from before a kernel update has no modules for the kernel the
+#     ESP will actually boot. The machine comes up without wifi or graphics.
+#     That one is a warning rather than a refusal — sometimes it is exactly
+#     what you want, and the fix afterwards is one pacman command.
+#
+# Usage:
+#   maze-rollback              list snapshots you can roll back to
+#   maze-rollback <number>     roll back to that snapshot (asks first)
+#   maze-rollback --undo       return to the subvolume that booted before
+set -u
+
+STATE_DIR=/var/lib/maze
+PREV_DEFAULT="$STATE_DIR/rollback-previous-default"
+SNAP_ROOT=/.snapshots
+
+die()  { echo "maze-rollback: $1" >&2; exit 1; }
+note() { echo "  $1"; }
+
+TARGET=""
+UNDO=0
+YES=0
+for a in "$@"; do
+    case "$a" in
+        --undo) UNDO=1 ;;
+        -y|--yes) YES=1 ;;
+        -h|--help) sed -n '4,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) die "unknown option '$a'" ;;
+        *)
+            case "$a" in
+                *[!0-9]*) die "'$a' is not a snapshot number" ;;
+            esac
+            TARGET="$a"
+            ;;
+    esac
+done
+
+[ "$(id -u)" -eq 0 ] || die "needs root — try: sudo $0 $*"
+
+command -v btrfs   >/dev/null 2>&1 || die "btrfs-progs is not installed"
+command -v snapper >/dev/null 2>&1 || die "snapper is not installed"
+
+[ "$(findmnt -no FSTYPE / 2>/dev/null)" = "btrfs" ] \
+    || die "/ is not btrfs — nothing to roll back to"
+
+echo "maze-rollback"
+echo
+
+# ── Is rollback even wired up on this machine? ──────────────────────────────
+#
+# Both halves have to be true, and they fail differently: a pinned cmdline
+# means the boot ignores the default subvolume, while a default pointing
+# somewhere other than the running root means we do not know what a subvol-less
+# mount would even land on. maze-enable-rollback sets up both.
+
+if grep -q 'rootflags=subvol=' /etc/kernel/cmdline 2>/dev/null; then
+    echo "  Rollback is not enabled on this machine."
+    echo
+    echo "  The kernel command line pins the root subvolume, so changing the"
+    echo "  btrfs default has no effect on what boots. Enable it once with:"
+    echo
+    echo "      sudo maze-enable-rollback --apply"
+    echo
+    exit 1
+fi
+
+cur_id="$(findmnt -no OPTIONS / 2>/dev/null | tr ',' '\n' \
+          | sed -n 's/^subvolid=//p' | head -n 1)"
+def_id="$(btrfs subvolume get-default / 2>/dev/null | awk '{print $2}')"
+[ -n "$cur_id" ] || die "could not read the running root subvolume id"
+[ -n "$def_id" ] || die "could not read the btrfs default subvolume"
+
+# ── --undo ──────────────────────────────────────────────────────────────────
+
+if [ "$UNDO" = 1 ]; then
+    [ -r "$PREV_DEFAULT" ] || die "no staged rollback to undo ($PREV_DEFAULT is missing)"
+    prev="$(cat "$PREV_DEFAULT")"
+    case "$prev" in ''|*[!0-9]*) die "$PREV_DEFAULT does not contain a subvolume id" ;; esac
+    btrfs subvolume set-default "$prev" / || die "set-default failed"
+    got="$(btrfs subvolume get-default / | awk '{print $2}')"
+    [ "$got" = "$prev" ] || die "set-default reported success but the default is $got"
+    rm -f "$PREV_DEFAULT"
+    note "default subvolume restored to $prev"
+    note "reboot to go back to it"
+    exit 0
+fi
+
+# Reached only when --undo was NOT asked for: the undo path above runs before
+# this, deliberately. A staged rollback is exactly the state undo exists for, so
+# checking for it first would have made the tool print "undo it with
+# maze-rollback --undo" and then refuse to do that very thing.
+if [ "$cur_id" != "$def_id" ]; then
+    echo "  The btrfs default subvolume ($def_id) is not the root that is"
+    echo "  running ($cur_id). That usually means a rollback is already staged"
+    echo "  and waiting for a reboot."
+    echo
+    echo "  Reboot to take it, or undo it with:  sudo maze-rollback --undo"
+    echo
+    exit 1
+fi
+
+# ── Listing ─────────────────────────────────────────────────────────────────
+
+fstab_is_clean() {   # $1 = snapshot number
+    _f="$SNAP_ROOT/$1/snapshot/etc/fstab"
+    [ -r "$_f" ] || return 1
+    ! awk '$1 !~ /^#/ && $2 == "/" && $4 ~ /subvol=/ { found = 1 }
+           END { exit !found }' "$_f" 2>/dev/null
+}
+
+snapshot_kernels() {  # $1 = snapshot number
+    _d="$SNAP_ROOT/$1/snapshot/usr/lib/modules"
+    [ -d "$_d" ] || return 0
+    ls -1 "$_d" 2>/dev/null | tr '\n' ' '
+}
+
+if [ -z "$TARGET" ]; then
+    snapper -c root list || die "could not list snapshots"
+    echo
+    echo "  Roll back with:  sudo maze-rollback <number>"
+    echo
+    echo "  Snapshots taken before rollback was enabled cannot be used: they"
+    echo "  still carry an /etc/fstab that pins the root subvolume, and booting"
+    echo "  one puts you straight back where you started. This tool checks."
+    echo
+    exit 0
+fi
+
+# ── Checks on the chosen snapshot ───────────────────────────────────────────
+
+snap_dir="$SNAP_ROOT/$TARGET/snapshot"
+[ -d "$snap_dir" ] || die "snapshot $TARGET does not exist at $snap_dir"
+
+note "target:  snapshot $TARGET"
+# Read the snapshot's own metadata rather than parsing `snapper list`: that
+# table is drawn with box characters, its column order has changed between
+# snapper releases, and it is meant for people, not for scripts.
+desc="$(sed -n 's|.*<description>\(.*\)</description>.*|\1|p' \
+        "$SNAP_ROOT/$TARGET/info.xml" 2>/dev/null | head -n 1)"
+[ -n "$desc" ] && note "         $desc"
+
+if ! fstab_is_clean "$TARGET"; then
+    echo
+    echo "  REFUSED: snapshot $TARGET pins the root subvolume in its /etc/fstab."
+    echo
+    echo "  It was taken before 'maze-enable-rollback --apply' ran. Booting it"
+    echo "  would mount you back onto the current root, so the rollback would"
+    echo "  look like it worked and change nothing."
+    echo
+    echo "  Snapshots taken after that point are fine."
+    echo
+    exit 1
+fi
+note "fstab:   clean (does not pin the root subvolume)"
+
+# The ESP is not snapshotted, so the kernel that boots is the one installed
+# now — the snapshot only supplies its modules.
+running="$(uname -r)"
+kernels="$(snapshot_kernels "$TARGET")"
+warn_modules=0
+if [ -n "$kernels" ]; then
+    case " $kernels " in
+        *" $running "*) note "kernel:  $running has modules in this snapshot" ;;
+        *)
+            warn_modules=1
+            note "kernel:  WARNING — no modules for the running kernel ($running)"
+            note "         snapshot has: $kernels"
+            ;;
+    esac
+fi
+
+# ── Confirm ─────────────────────────────────────────────────────────────────
+
+echo
+echo "  This will make snapshot $TARGET the system that boots. Your current"
+echo "  root is kept — snapper takes a read-only copy of it first, and"
+echo "  'sudo maze-rollback --undo' puts it back."
+if [ "$warn_modules" = 1 ]; then
+    echo
+    echo "  Because the boot partition is not part of a snapshot, the machine"
+    echo "  will boot kernel $running and find no modules for it in there."
+    echo "  Expect no wifi and possibly no graphics. Repair after booting with:"
+    echo "      sudo pacman -S linux linux-lts"
+fi
+echo
+
+if [ "$YES" != 1 ]; then
+    printf "  Type the snapshot number again to confirm: "
+    read -r answer
+    [ "$answer" = "$TARGET" ] || die "not confirmed — nothing changed"
+    echo
+fi
+
+# ── Do it ───────────────────────────────────────────────────────────────────
+
+mkdir -p "$STATE_DIR"
+printf '%s\n' "$cur_id" > "$PREV_DEFAULT"
+
+# --ambit classic is the whole reason this wrapper exists; see the header.
+if ! snapper --ambit classic rollback "$TARGET"; then
+    rm -f "$PREV_DEFAULT"
+    die "snapper rollback failed — nothing was changed"
+fi
+
+new_def="$(btrfs subvolume get-default / 2>/dev/null | awk '{print $2}')"
+if [ "$new_def" = "$cur_id" ]; then
+    rm -f "$PREV_DEFAULT"
+    die "snapper reported success but the default subvolume is still $cur_id"
+fi
+note "default subvolume is now $new_def"
+
+if command -v maze-boot-check >/dev/null 2>&1; then
+    echo
+    maze-boot-check || true
+fi
+
+echo
+note "Reboot to boot snapshot $TARGET."
+note "If it is not what you wanted:  sudo maze-rollback --undo"
+echo

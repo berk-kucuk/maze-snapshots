@@ -1,0 +1,8 @@
+# Maze Linux — units shipped by the maze-snapshots package.
+#
+# snapper-cleanup keeps the snapshot count bounded. snapper-timeline is
+# deliberately NOT enabled: pacman-triggered snapshots (snap-pac) are what this
+# package is for, and hourly timeline snapshots are a separate decision.
+
+enable maze-snapshots-setup.service
+enable snapper-cleanup.timer

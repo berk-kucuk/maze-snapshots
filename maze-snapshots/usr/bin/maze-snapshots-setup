@@ -1,0 +1,211 @@
+#!/bin/sh
+# Managed by Maze Linux (maze-snapshots).
+#
+# Two jobs, run at every boot, each idempotent and each safe to run on a
+# machine where it has nothing to do:
+#
+#   1. Create the snapper configuration for / the first time it can.
+#   2. Make sure /.snapshots is mounted from the subvolume that actually holds
+#      the snapshots, rather than being whatever empty directory happens to sit
+#      at that path in the running root.
+#
+# Why a boot-time unit and not just a pacman scriptlet: on a fresh install the
+# package is unpacked into the ISO's airootfs and copied onto the target, so the
+# scriptlet never runs against the real btrfs root. This unit runs on the
+# installed machine, where the filesystem it needs to configure actually exists.
+#
+# Why job 2 is not part of job 1: job 1 only ever happens once, and job 2 has to
+# reach machines that were configured long before this script learned to do it.
+set -u
+
+CONF=/etc/snapper/configs/root
+FSTAB=/etc/fstab
+
+log() { echo "maze-snapshots: $*"; }
+err() { echo "maze-snapshots: $*" >&2; }
+
+# Only meaningful on btrfs. An ext4 or xfs root is left completely alone.
+fstype="$(findmnt -no FSTYPE / 2>/dev/null || true)"
+if [ "$fstype" != "btrfs" ]; then
+    log "/ is ${fstype:-unknown}, not btrfs — nothing to configure"
+    exit 0
+fi
+
+# ── 1. snapper configuration ────────────────────────────────────────────────
+
+create_config() {
+    [ -e "$CONF" ] && return 0
+
+    # A /.snapshots that snapper did not create (a hand-made @snapshots
+    # subvolume, a restored layout) would make create-config fail with a
+    # confusing error. Report it and leave the admin's layout untouched.
+    if [ -e /.snapshots ]; then
+        err "/.snapshots exists but no snapper config does."
+        err "leaving it alone — configure snapper by hand if you want it managed."
+        return 1
+    fi
+
+    command -v snapper >/dev/null 2>&1 || { err "snapper not installed"; return 1; }
+
+    log "creating the snapper configuration for /"
+    if ! snapper -c root create-config /; then
+        err "create-config failed; snapshots are NOT active"
+        return 1
+    fi
+
+    # Pacman-triggered snapshots (snap-pac) are the point of this package.
+    # Snapper's own hourly timeline is a different feature with a different disk
+    # profile, so it stays off unless the admin turns it on deliberately.
+    snapper -c root set-config \
+        TIMELINE_CREATE=no \
+        NUMBER_CLEANUP=yes \
+        NUMBER_MIN_AGE=1800 \
+        NUMBER_LIMIT=20 \
+        NUMBER_LIMIT_IMPORTANT=10 >/dev/null 2>&1 || true
+
+    # `snapper create-config` does not only write the config: through snapperd
+    # it also runs `systemctl enable --now snapper-timeline.timer` (seen in the
+    # first-boot journal of a real install — "Started Timeline of Snapper
+    # Snapshots" right between our two log lines). TIMELINE_CREATE=no above makes
+    # that timer a no-op, but it stays enabled and fires every hour, and the
+    # preset that says "timeline is deliberately off" is then a lie. Undo it
+    # here, in the same run, so the state matches the intent.
+    systemctl disable --now snapper-timeline.timer >/dev/null 2>&1 || true
+
+    # Snapshots are a recovery tool, not a place to browse other users' files.
+    chmod 750 /.snapshots 2>/dev/null || true
+
+    log "done. Every pacman transaction is now snapshotted (snap-pac)."
+    log "list them with 'snapper -c root list'."
+    return 0
+}
+
+# ── 2. /.snapshots mount ────────────────────────────────────────────────────
+#
+# The snapshot store is a subvolume nested inside the root subvolume, at
+# @/.snapshots. Nested subvolumes are NOT included in a snapshot of their
+# parent — they appear as an empty directory. So the moment you roll back and
+# boot a snapshot, /.snapshots inside it is empty, snapper reports no snapshots
+# at all, and the one tool you need to roll forward again is blind.
+#
+# An fstab entry fixes this the way openSUSE does: mount the store explicitly,
+# from the same place, whichever root is booted.
+#
+# nofail is deliberate. A wrong entry here must cost snapshots, never the boot.
+
+# The root of a btrfs subvolume is always inode 256; an ordinary directory
+# inside one never is. Cheap, unprivileged, and independent of how
+# `btrfs subvolume list` chooses to print paths.
+is_btrfs_subvolume() {
+    [ -d "$1" ] || return 1
+    [ "$(stat -c %i "$1" 2>/dev/null)" = "256" ]
+}
+
+root_subvol() {
+    findmnt -no OPTIONS / 2>/dev/null | tr ',' '\n' \
+        | sed -n 's/^subvol=//p' | head -n 1
+}
+
+# The subvolume that holds the store, as a path from the top of the filesystem.
+# Booted normally that is "@/.snapshots"; booted from a rollback the running
+# root is "@/.snapshots/<n>/snapshot", and the store is still the same place.
+snapshots_subvol() {
+    sub="$(root_subvol)"
+    sub="${sub#/}"
+    case "$sub" in
+        */.snapshots/*) echo "${sub%%/.snapshots/*}/.snapshots" ;;
+        .snapshots/*)   echo ".snapshots" ;;
+        "")             echo ".snapshots" ;;
+        *)              echo "$sub/.snapshots" ;;
+    esac
+}
+
+# Field 1 of the existing / line — device path or UUID=. Reusing it verbatim
+# means the new entry can never disagree with the one that already works.
+root_fstab_source() {
+    awk '$1 !~ /^#/ && $2 == "/" { print $1; exit }' "$FSTAB" 2>/dev/null
+}
+
+ensure_snapshots_mount() {
+    [ -e "$CONF" ] || return 0        # nothing to mount until snapper exists
+    [ -f "$FSTAB" ] || return 0
+
+    # Already described in fstab, by us or by the admin: never touch it twice.
+    if awk '$1 !~ /^#/ && $2 == "/.snapshots" { found = 1 } END { exit !found }' \
+            "$FSTAB" 2>/dev/null; then
+        return 0
+    fi
+
+    src="$(root_fstab_source)"
+    if [ -z "$src" ]; then
+        err "no / line in $FSTAB — not adding a /.snapshots entry"
+        return 1
+    fi
+
+    sub="$(snapshots_subvol)"
+    if [ -z "$sub" ]; then
+        err "could not work out the root subvolume — not adding a /.snapshots entry"
+        return 1
+    fi
+
+    # Prove /.snapshots really is a subvolume before writing a line that mounts
+    # it as one.
+    #
+    # NOT done by matching `btrfs subvolume list` output: that command prints a
+    # path relative to the subvolume you query from, so on a machine booted into
+    # @ the store is listed as ".snapshots" while the path this script needs for
+    # fstab is "@/.snapshots". Comparing the two never matched, and the entry was
+    # skipped on every machine with the message "no @/.snapshots subvolume yet" —
+    # which reads like a legitimate skip rather than a bug, so it stayed quiet.
+    #
+    # The inode number answers the actual question: the root of every btrfs
+    # subvolume is inode 256. It needs no privileges, no parsing, and cannot
+    # drift with btrfs-progs output formatting.
+    if ! is_btrfs_subvolume /.snapshots; then
+        log "/.snapshots is not a btrfs subvolume — skipping the fstab entry"
+        return 0
+    fi
+
+    log "adding a /.snapshots entry for subvol=$sub"
+    {
+        echo ""
+        echo "# Added by maze-snapshots. The snapshot store is a subvolume nested"
+        echo "# inside the root subvolume, so it is invisible from inside a"
+        echo "# snapshot. Mounting it explicitly keeps 'snapper list' working"
+        echo "# after a rollback, which is when it is needed most."
+        echo "$src	/.snapshots	btrfs	subvol=$sub,noatime,nofail	0 0"
+    } >> "$FSTAB"
+
+    mkdir -p /.snapshots 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if mountpoint -q /.snapshots; then
+        log "/.snapshots already mounted"
+    elif mount /.snapshots 2>/dev/null; then
+        log "/.snapshots mounted"
+    else
+        # nofail means this costs snapshots, not the next boot. Say so rather
+        # than leaving a line nobody knows failed.
+        err "the /.snapshots entry was written but would not mount — check $FSTAB"
+    fi
+    chmod 750 /.snapshots 2>/dev/null || true
+    return 0
+}
+
+# ── 3. timeline timer ───────────────────────────────────────────────────────
+#
+# Reaches machines whose config was created BEFORE create_config learned to
+# disable the timer (job 1 only ever runs once). Idempotent, and it defers to
+# the admin: if TIMELINE_CREATE was switched to yes by hand, the timer is
+# theirs and is left alone.
+ensure_timeline_off() {
+    [ -r "$CONF" ] || return 0
+    grep -qE '^TIMELINE_CREATE="?no"?' "$CONF" 2>/dev/null || return 0
+    [ "$(systemctl is-enabled snapper-timeline.timer 2>/dev/null)" = "enabled" ] || return 0
+    log "TIMELINE_CREATE=no but snapper-timeline.timer is enabled (snapper's create-config does that) — disabling it"
+    systemctl disable --now snapper-timeline.timer >/dev/null 2>&1 || true
+}
+
+create_config || true
+ensure_snapshots_mount || true
+ensure_timeline_off || true
+exit 0

@@ -1,0 +1,15 @@
+[Unit]
+Description=Create the Maze snapper configuration for / (once)
+# Skips itself entirely once the configuration exists, so this costs nothing on
+# every boot after the first.
+ConditionPathExists=!/etc/snapper/configs/root
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/bin/maze-snapshots-setup
+
+[Install]
+WantedBy=multi-user.target

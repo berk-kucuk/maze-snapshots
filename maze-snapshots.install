@@ -1,0 +1,55 @@
+# maze-snapshots.install — enable the units, and configure snapper immediately
+# when we are on a real running system.
+#
+# The boot-time unit is the reliable path (see maze-snapshots-setup for why),
+# but on an already-installed machine there is no reason to make the admin wait
+# for a reboot to get their first snapshot.
+
+_UNITS="maze-snapshots-setup.service snapper-cleanup.timer"
+
+_enable() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl preset $_UNITS >/dev/null 2>&1 || \
+        systemctl enable $_UNITS >/dev/null 2>&1 || true
+    # `enable` writes symlinks but starts nothing: without this the cleanup timer
+    # sits idle until the next boot while snap-pac keeps creating snapshots.
+    if [ -d /run/systemd/system ]; then
+        systemctl start snapper-cleanup.timer >/dev/null 2>&1 || true
+    fi
+}
+
+_announce() {
+    echo ">> maze-snapshots: roll back to a snapshot with 'sudo maze-rollback'."
+    echo ">>   It lists what you can go back to and refuses the ones that would"
+    echo ">>   not actually take effect. Full rollback needs the boot setup from"
+    echo ">>   'sudo maze-enable-rollback --apply' — maze-rollback says so if it"
+    echo ">>   is missing."
+}
+
+post_install() {
+    _enable
+    # Live system only: inside the ISO build chroot / is not the btrfs root this
+    # would configure, and snapper's D-Bus interface is not running.
+    if [ -d /run/systemd/system ]; then
+        /usr/bin/maze-snapshots-setup || true
+    else
+        echo ">> maze-snapshots: will configure snapper on first boot."
+    fi
+    _announce
+}
+
+post_upgrade() {
+    _enable
+    # Re-runs every upgrade on purpose: it is now also what adds the /.snapshots
+    # fstab entry, and machines configured by an older version never had one.
+    if [ -d /run/systemd/system ]; then
+        /usr/bin/maze-snapshots-setup || true
+    fi
+    _announce
+}
+
+post_remove() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    echo ">> maze-snapshots: REMOVED. Existing snapshots are kept; new pacman"
+    echo ">>   transactions are no longer snapshotted."
+}
