@@ -20,7 +20,7 @@
 
 pkgname=maze-snapshots
 pkgver=1.1.0
-pkgrel=4
+pkgrel=6
 pkgdesc="Maze Linux automatic btrfs snapshots — every pacman transaction is rollback-able"
 arch=('any')
 url="https://mazelinux.berkkucukk.com.tr"

@@ -175,17 +175,29 @@ if ! fstab_is_clean "$TARGET"; then
 fi
 note "fstab:   clean (does not pin the root subvolume)"
 
-# The ESP is not snapshotted, so the kernel that boots is the one installed
-# now — the snapshot only supplies its modules.
-running="$(uname -r)"
+# The ESP is not snapshotted, so the kernel that boots is the one on the ESP
+# now — the snapshot only supplies its modules. That is the kernel recorded in
+# grubx64.efi.maze-kver by maze-sb-sign, NOT necessarily `uname -r`: after a
+# kernel update without a reboot the two differ, and checking the running one
+# would approve a snapshot that has no modules for the kernel about to boot.
+boot_kver() {
+    _esp="$(bootctl --print-esp-path 2>/dev/null || true)"
+    for _e in "$_esp" /efi /boot; do
+        [ -n "$_e" ] && [ -r "$_e/EFI/BOOT/grubx64.efi.maze-kver" ] || continue
+        _k="$(tr -d '[:space:]' < "$_e/EFI/BOOT/grubx64.efi.maze-kver" 2>/dev/null)"
+        [ -n "$_k" ] && { printf '%s\n' "$_k"; return 0; }
+    done
+    uname -r
+}
+running="$(boot_kver)"
 kernels="$(snapshot_kernels "$TARGET")"
 warn_modules=0
 if [ -n "$kernels" ]; then
     case " $kernels " in
-        *" $running "*) note "kernel:  $running has modules in this snapshot" ;;
+        *" $running "*) note "kernel:  $running (the one that boots) has modules in this snapshot" ;;
         *)
             warn_modules=1
-            note "kernel:  WARNING — no modules for the running kernel ($running)"
+            note "kernel:  WARNING — no modules for the kernel that boots ($running)"
             note "         snapshot has: $kernels"
             ;;
     esac

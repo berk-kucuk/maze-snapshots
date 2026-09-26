@@ -37,6 +37,12 @@
 #   maze-enable-rollback           check what would change, change nothing
 #   maze-enable-rollback --apply   do it
 #   maze-enable-rollback --undo    put `rootflags=subvol=` back
+#
+#   --no-rebuild   with --apply: change the default subvolume, cmdline and fstab
+#                  but leave the UKI rebuild to the caller. For the installer,
+#                  which runs this in the target chroot before its own final
+#                  UKI build and before Secure Boot is set up (so the re-sign
+#                  and boot check here could only fail).
 set -u
 
 CMDLINE=/etc/kernel/cmdline
@@ -46,11 +52,13 @@ FSTAB_BACKUP=/var/lib/maze/fstab.pre-rollback
 
 APPLY=0
 UNDO=0
+REBUILD=1
 for a in "$@"; do
     case "$a" in
         --apply) APPLY=1 ;;
         --undo)  UNDO=1 ;;
-        -h|--help) sed -n '4,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --no-rebuild) REBUILD=0 ;;
+        -h|--help) sed -n '4,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "maze-enable-rollback: unknown option '$a'" >&2; exit 2 ;;
     esac
 done
@@ -280,6 +288,11 @@ if [ "$fstab_pins" = 1 ]; then
     note "new fstab / line: $(sed -n "${fstab_line}p" "$FSTAB")"
 fi
 echo
+
+if [ "$REBUILD" = 0 ]; then
+    note "Done (no rebuild requested: the caller builds the UKI from the new cmdline)."
+    exit 0
+fi
 
 if rebuild_and_check; then
     echo
