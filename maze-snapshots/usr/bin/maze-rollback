@@ -32,9 +32,15 @@
 #   maze-rollback --undo       return to the subvolume that booted before
 set -u
 
-STATE_DIR=/var/lib/maze
-PREV_DEFAULT="$STATE_DIR/rollback-previous-default"
 SNAP_ROOT=/.snapshots
+# The record of the root we left lives in the snapshot store, NOT under
+# /var/lib: /var/lib is part of the root subvolume, so after rebooting into the
+# snapshot it is the snapshot's own (older) /var/lib, the record is gone, and
+# --undo — the promised way back — refused with "no staged rollback". The store
+# is mounted from the same subvolume in every root (maze-snapshots-setup's
+# fstab entry), so the record survives the reboot it exists for.
+PREV_DEFAULT="$SNAP_ROOT/.maze-rollback-previous-default"
+LEGACY_PREV_DEFAULT=/var/lib/maze/rollback-previous-default   # before 1.1.0-7
 
 die()  { echo "maze-rollback: $1" >&2; exit 1; }
 note() { echo "  $1"; }
@@ -95,13 +101,15 @@ def_id="$(btrfs subvolume get-default / 2>/dev/null | awk '{print $2}')"
 # ── --undo ──────────────────────────────────────────────────────────────────
 
 if [ "$UNDO" = 1 ]; then
-    [ -r "$PREV_DEFAULT" ] || die "no staged rollback to undo ($PREV_DEFAULT is missing)"
-    prev="$(cat "$PREV_DEFAULT")"
-    case "$prev" in ''|*[!0-9]*) die "$PREV_DEFAULT does not contain a subvolume id" ;; esac
+    rec="$PREV_DEFAULT"
+    [ -r "$rec" ] || rec="$LEGACY_PREV_DEFAULT"
+    [ -r "$rec" ] || die "no rollback to undo ($PREV_DEFAULT is missing)"
+    prev="$(cat "$rec")"
+    case "$prev" in ''|*[!0-9]*) die "$rec does not contain a subvolume id" ;; esac
     btrfs subvolume set-default "$prev" / || die "set-default failed"
     got="$(btrfs subvolume get-default / | awk '{print $2}')"
     [ "$got" = "$prev" ] || die "set-default reported success but the default is $got"
-    rm -f "$PREV_DEFAULT"
+    rm -f "$PREV_DEFAULT" "$LEGACY_PREV_DEFAULT"
     note "default subvolume restored to $prev"
     note "reboot to go back to it"
     exit 0
@@ -139,6 +147,19 @@ snapshot_kernels() {  # $1 = snapshot number
 if [ -z "$TARGET" ]; then
     snapper -c root list || die "could not list snapshots"
     echo
+    # Snapshot 0 is snapper's name for the running system, not a snapshot. A
+    # list with nothing else in it looks like a table with one usable row, so
+    # say plainly that there is nothing to go back to yet, and why.
+    if ! ls -1 "$SNAP_ROOT" 2>/dev/null | grep -qx '[0-9][0-9]*'; then
+        echo "  No snapshots yet. '0 current' is the running system itself."
+        echo
+        echo "  Snapshots are taken automatically before and after every pacman"
+        echo "  transaction (install, remove, -Syu). To take one by hand:"
+        echo
+        echo "      sudo snapper -c root create -d \"before my change\""
+        echo
+        exit 0
+    fi
     echo "  Roll back with:  sudo maze-rollback <number>"
     echo
     echo "  Snapshots taken before rollback was enabled cannot be used: they"
@@ -227,8 +248,9 @@ fi
 
 # ── Do it ───────────────────────────────────────────────────────────────────
 
-mkdir -p "$STATE_DIR"
-printf '%s\n' "$cur_id" > "$PREV_DEFAULT"
+rm -f "$LEGACY_PREV_DEFAULT"
+printf '%s\n' "$cur_id" > "$PREV_DEFAULT" \
+    || die "could not write $PREV_DEFAULT — nothing was changed"
 
 # --ambit classic is the whole reason this wrapper exists; see the header.
 if ! snapper --ambit classic rollback "$TARGET"; then
