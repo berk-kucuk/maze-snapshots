@@ -68,3 +68,9 @@ git clone https://github.com/berk-kucuk/maze-snapshots.git
 cd maze-snapshots
 makepkg -si
 ```
+
+## License
+
+Copyright © 2026 Berk Küçük
+
+Released under the GNU General Public License v3.0 — see [LICENSE](LICENSE).
