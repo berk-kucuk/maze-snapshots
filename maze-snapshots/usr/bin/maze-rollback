@@ -150,7 +150,12 @@ if [ -z "$TARGET" ]; then
     # Snapshot 0 is snapper's name for the running system, not a snapshot. A
     # list with nothing else in it looks like a table with one usable row, so
     # say plainly that there is nothing to go back to yet, and why.
-    if ! ls -1 "$SNAP_ROOT" 2>/dev/null | grep -qx '[0-9][0-9]*'; then
+    _any=0
+    for _s in "$SNAP_ROOT"/[0-9]*; do
+        case "${_s##*/}" in *[!0-9]*) continue ;; esac
+        [ -d "$_s" ] && { _any=1; break; }
+    done
+    if [ "$_any" -eq 0 ]; then
         echo "  No snapshots yet. '0 current' is the running system itself."
         echo
         echo "  Snapshots are taken automatically before and after every pacman"
